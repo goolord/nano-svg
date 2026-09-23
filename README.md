@@ -47,17 +47,11 @@ Nested `svg` and referenced `symbol` elements do not establish viewports.
 
 ## Modules
 
-The parsing modules can also be used independently for individual path,
-transform, color or length values.
-
 | Module | Purpose |
 | --- | --- |
-| `Graphics.NanoSvg` | `parseSvg`, and the types re-exported |
-| `Graphics.NanoSvg.Types` | the document model, on its own |
-| `Graphics.NanoSvg.Xml` | the tree, entity decoding, `DOCTYPE` and prefix stripping |
-| `Graphics.NanoSvg.Path` | path and transform parsing; basic shapes as segments |
-| `Graphics.NanoSvg.Color` | paints, colors, the keyword table |
-| `Graphics.NanoSvg.Number` | numbers, lengths, number and point lists |
+| `Graphics.NanoSvg` | `parseSvg`, re-exporting the two below |
+| `Graphics.NanoSvg.Types` | the document model and matrix helpers |
+| `Graphics.NanoSvg.Attribute` | standalone parsers for paths, transforms, colors, numbers and lengths |
 
 ## Build
 

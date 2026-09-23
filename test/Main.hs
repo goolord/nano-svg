@@ -6,10 +6,6 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Char8 qualified as BC
 import Data.Foldable (toList)
 import Graphics.NanoSvg
-import Graphics.NanoSvg.Color (namedColor, parseColor, parsePaint)
-import Graphics.NanoSvg.Number
-import Graphics.NanoSvg.Path (parsePath, parseTransform)
-import Graphics.NanoSvg.Xml
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck
@@ -57,8 +53,8 @@ numbers =
         parseNumber "abc" @?= Nothing
     , testCase "an exponent with no digits is not an exponent" do
         -- The @e@ belongs to the unit, so this is one em and not a failure.
-        parseLength "1em" @?= Just (Length 1 Em)
-        parseLength "1ex" @?= Just (Length 1 Ex)
+        parseLength "1e1px" @?= Just 10
+        styleStrokeWidth (shapeStyle (oneShape "<svg><path stroke-width='1em' d='M0 0L1 1'/></svg>")) @?= 1
     , testCase "many digits still land on the right value" do
         parseNumber "0.30000000000000004" @?= Just 0.3
         parseNumber "123456789012345678901234" @?= Just 1.2345679e23
@@ -72,25 +68,13 @@ numbers =
         parseNumber "1e-400" @?= Just 0
         parsePath "M1 1L1e400 0" @?= [MoveTo (Point 1 1)]
         sizeOf "<svg width='1e400' height='1e400'/>" @?= (24, 24)
-    , testCase "lists stop at the first thing that is not a number" do
-        parseNumberList "1 2 3" @?= [1, 2, 3]
-        parseNumberList "1,2 , 3" @?= [1, 2, 3]
-        parseNumberList " 1 2 oops 3" @?= [1, 2]
-        parseNumberList "" @?= []
-    , testCase "a viewBox is four of them" do
-        parseNumberList "0 0 24 24" @?= [0, 0, 24, 24]
-        parseNumberList "0 0 24" @?= [0, 0, 24]
-        parseNumberList "0 0 24 24 24" @?= [0, 0, 24, 24, 24]
-    , testCase "an odd point is dropped" do
-        parsePointList "0,0 1,1 2" @?= [Point 0 0, Point 1 1]
+    , testCase "an odd point is dropped" $
+        map (toList . shapeSegments) (shapesOf "<svg><polyline points='0,0 1,1 2'/></svg>")
+          @?= [[MoveTo (Point 0 0), LineTo (Point 1 1)]]
     , testProperty "agrees with read, to single precision" \(x :: Float) ->
         let rendered = BC.pack (show x)
          in counterexample (show rendered) $
               maybe False (nearly x) (parseNumber rendered)
-    , testProperty "reads a list of them" \(xs :: [Float]) ->
-        let rendered = BC.unwords (map (BC.pack . show) xs)
-            parsed = parseNumberList rendered
-         in length parsed == length xs && and (zipWith nearly xs parsed)
     ]
 
 -- | Equal to within a single-precision ulp or so, and equal on the
@@ -109,26 +93,22 @@ lengths :: TestTree
 lengths =
   testGroup
     "lengths"
-    [ testCase "units are read" do
-        parseLength "10" @?= Just (Length 10 UserSpace)
-        parseLength "10px" @?= Just (Length 10 Px)
-        parseLength "10PX" @?= Just (Length 10 Px)
-        parseLength "10pt" @?= Just (Length 10 Pt)
-        parseLength "10%" @?= Just (Length 10 Percent)
-        parseLength "10 " @?= Just (Length 10 UserSpace)
+    [ testCase "the absolute ones resolve at 96 dpi" do
+        parseLength "10" @?= Just 10
+        parseLength "10px" @?= Just 10
+        parseLength "10PX" @?= Just 10
+        parseLength "10 " @?= Just 10
         parseLength "10 px" @?= Nothing
-    , testCase "the absolute ones resolve at 96 dpi" do
-        parseUserUnits "10" @?= Just 10
-        parseUserUnits "10px" @?= Just 10
-        parseUserUnits "1in" @?= Just 96
-        parseUserUnits "72pt" @?= Just 96
-        parseUserUnits "6pc" @?= Just 96
-        fmap (round :: Float -> Int) (parseUserUnits "2.54cm") @?= Just 96
-        fmap (round :: Float -> Int) (parseUserUnits "25.4mm") @?= Just 96
+        parseLength "1in" @?= Just 96
+        parseLength "72pt" @?= Just 96
+        parseLength "6pc" @?= Just 96
+        fmap (round :: Float -> Int) (parseLength "2.54cm") @?= Just 96
+        fmap (round :: Float -> Int) (parseLength "25.4mm") @?= Just 96
     , testCase "and the relative ones do not" do
-        parseUserUnits "50%" @?= Nothing
-        parseUserUnits "2em" @?= Nothing
-        parseUserUnits "2ex" @?= Nothing
+        parseLength "50%" @?= Nothing
+        parseLength "2em" @?= Nothing
+        parseLength "2ex" @?= Nothing
+        parseLength "2foo" @?= Nothing
     ]
 
 --------------------------------------------------------------------------------
@@ -162,10 +142,13 @@ colors =
     , testCase "all 148 keywords, in any case" do
         parseColor "red" @?= Just (rgba 255 0 0 255)
         parseColor "REBECCAPURPLE" @?= Just (rgba 0x66 0x33 0x99 255)
-        parseColor "rebeccapurple" @?= namedColor "rebeccapurple"
+        parseColor "aliceblue" @?= Just (rgba 0xf0 0xf8 0xff 255)
+        parseColor "yellowgreen" @?= Just (rgba 0x9a 0xcd 0x32 255)
         parseColor "lightgoldenrodyellow" @?= Just (rgba 0xfa 0xfa 0xd2 255)
         parseColor "grey" @?= parseColor "gray"
         parseColor "notacolor" @?= Nothing
+        parseColor "transparent" @?= Nothing
+        show (rgba 1 2 3 255) @?= "#010203ff"
     , testCase "paint keywords are not colors" do
         parsePaint "none" @?= Just PaintNone
         parsePaint "transparent" @?= Just PaintNone
@@ -309,41 +292,23 @@ xml :: TestTree
 xml =
   testGroup
     "xml"
-    [ testCase "elements and attributes" $
-        parseXml "<a x='1'><b/></a>"
-          @?= Right [Element "a" [Attribute "x" "1"] [Element "b" [] []]]
-    , testCase "namespace prefixes are dropped" $
-        fmap (map elementName) (parseXml "<svg:svg><svg:path/></svg:svg>")
-          @?= Right ["svg"]
-    , testCase "comments and instructions are not in the tree" $
-        fmap (map elementName) (parseXml "<?xml version='1.0'?><!--hi--><a/>")
-          @?= Right ["a"]
-    , testCase "a doctype is stepped over" $
-        fmap (map elementName) (parseXml "<!DOCTYPE svg PUBLIC \"x\" \"y\"><svg/>")
-          @?= Right ["svg"]
-    , testCase "including one with an internal subset" $
-        fmap (map elementName) (parseXml "<!DOCTYPE svg [<!ENTITY x \"y\">]><svg/>")
-          @?= Right ["svg"]
-    , testCase "and so is a byte-order mark" $
-        fmap (map elementName) (parseXml "\xEF\xBB\xBF<svg/>")
-          @?= Right ["svg"]
+    [ testCase "namespace prefixes are dropped" do
+        length (shapesOf "<svg:svg><svg:rect width='1' height='1'/></svg:svg>") @?= 1
+        length (shapesOf useDoc) @?= 1
+    , testCase "comments, instructions, doctypes and byte-order marks are skipped" do
+        sizeOf "<?xml version='1.0'?><!--hi--><svg width='3'/>" @?= (3, 24)
+        sizeOf "<!DOCTYPE svg PUBLIC \"x\" \"y\"><svg width='3'/>" @?= (3, 24)
+        sizeOf "<!DOCTYPE svg [<!ENTITY x \"y\">]><svg width='3'/>" @?= (3, 24)
+        sizeOf "ï»¿<svg width='3'/>" @?= (3, 24)
     , testCase "entities in attribute values" do
-        decodeEntities "a&amp;b" @?= "a&b"
-        decodeEntities "&lt;&gt;&quot;&apos;" @?= "<>\"'"
-        decodeEntities "&#65;&#x42;&#X43;" @?= "ABC"
-        decodeEntities "&#x2713;" @?= "\xE2\x9C\x93"
-        decodeEntities "plain" @?= "plain"
-        decodeEntities "50% &amp; more" @?= "50% & more"
-    , testCase "an ampersand that begins nothing stands for itself" do
-        decodeEntities "a & b" @?= "a & b"
-        decodeEntities "&nosuch;" @?= "&nosuch;"
-        decodeEntities "&#;" @?= "&#;"
-    , testCase "attributes are looked up by local name" do
-        let el = Element "use" [Attribute "href" "#a"] []
-        attribute "href" el @?= Just "#a"
-        attribute "x" el @?= Nothing
+        styleFill (shapeStyle (oneShape "<svg><path fill='&#x72;&#101;&#X64;' d='M0 0L1 1'/></svg>"))
+          @?= Just (PaintColor (rgba 255 0 0 255))
+        map (length . toList . shapeSegments) (shapesOf "<svg><path d='M0 0&#10;L1 1'/></svg>") @?= [2]
+    , testCase "an ampersand that begins nothing stands for itself" $
+        map (length . toList . shapeSegments) (shapesOf "<svg><path d='M0 0 &amp L1 1 &nosuch; &#;'/></svg>")
+          @?= [1]
     , testCase "a document that is not one" $
-        assertBool "expected a Left" (isLeft (parseXml "<a><b></a>"))
+        assertBool "expected a Left" (isLeft (parseSvg "<svg><b></svg>"))
     ]
 
 isLeft :: Either a b -> Bool
