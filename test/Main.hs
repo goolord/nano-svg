@@ -429,6 +429,12 @@ documents =
         length (shapesOf (circularFanout 12)) @?= 1
     , testCase "and a self-referential one terminates" $
         length (shapesOf circular) <= 8 @?= True
+    , testCase "uses nest up to the limit and no deeper" do
+        length (shapesOf (useChain maxUseDepth)) @?= 1
+        length (shapesOf (useChain (maxUseDepth + 1))) @?= 0
+    , testCase "so a use that fans out cannot explode" do
+        length (shapesOf (fanout (maxUseDepth - 1))) @?= 2 ^ (maxUseDepth - 1)
+        length (shapesOf (fanout 40)) @?= 0
     , testCase "display and visibility prune the subtree" do
         shapesOf "<svg><g display='none'><rect width='1' height='1'/></g></svg>" @?= []
         shapesOf "<svg><rect style='display:none' width='1' height='1'/></svg>" @?= []
@@ -506,6 +512,22 @@ circularFanout n =
   "<svg><defs><g id='a'>"
     <> mconcat (replicate n "<use href='#a'/>")
     <> "<rect width='1' height='1'/></g></defs><use href='#a'/></svg>"
+
+-- | @n@ nested uses, the innermost of a rectangle.
+useChain :: Int -> ByteString
+useChain n =
+  "<svg><defs>"
+    <> mconcat [BC.pack ("<use id='u" <> show i <> "' href='#u" <> show (i + 1) <> "'/>") | i <- [1 .. n - 1]]
+    <> BC.pack ("<rect id='u" <> show n <> "' width='1' height='1'/>")
+    <> "</defs><use href='#u1'/></svg>"
+
+-- | A use of @n@ levels of groups, each drawing the one below it twice,
+-- over a rectangle: @2^n@ rectangles at @n + 1@ nested uses.
+fanout :: Int -> ByteString
+fanout n =
+  "<svg><defs><rect id='g0' width='1' height='1'/>"
+    <> mconcat [BC.pack ("<g id='g" <> show i <> "'><use href='#g" <> show (i - 1) <> "'/><use href='#g" <> show (i - 1) <> "'/></g>") | i <- [1 .. n]]
+    <> BC.pack ("</defs><use href='#g" <> show n <> "'/></svg>")
 
 circular :: ByteString
 circular =

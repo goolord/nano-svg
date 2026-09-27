@@ -14,7 +14,8 @@
 -- = Supported SVG
 --
 -- The elements @svg@, @g@, @a@, @switch@, @use@, @path@, @rect@, @circle@,
--- @ellipse@, @line@, @polyline@ and @polygon@, with @use@ resolved by @id@.
+-- @ellipse@, @line@, @polyline@ and @polygon@, with @use@ resolved by @id@
+-- and nested at most 'maxUseDepth' deep.
 -- The properties @fill@, @stroke@, @stroke-width@, @stroke-linecap@,
 -- @stroke-linejoin@, @stroke-miterlimit@, @fill-rule@, @opacity@,
 -- @fill-opacity@, @stroke-opacity@, @display@ and @visibility@, as
@@ -31,6 +32,7 @@
 -- @preserveAspectRatio@ is left to the renderer.
 module Graphics.NanoSvg
   ( parseSvg
+  , maxUseDepth
   , module Graphics.NanoSvg.Types
   , module Graphics.NanoSvg.Attribute
   )
@@ -80,7 +82,7 @@ parseSvg src = do
       }
 
 -- | Prepend the shapes an element draws. @open@ holds the @use@ targets
--- being expanded, to cut reference cycles.
+-- being expanded, to cut reference cycles and bound nesting.
 collect :: Map ByteString Element -> Set ByteString -> Matrix -> Style -> Element -> [Shape] -> [Shape]
 collect ids open outer inherited el rest
   | keyword "display" == Just "none" || keyword "visibility" `elem` [Just "hidden", Just "collapse"] = rest
@@ -88,7 +90,7 @@ collect ids open outer inherited el rest
       t | t `elem` ["svg", "g", "a"] -> foldr into rest (kids el)
       "switch" -> foldr (\kid next -> case into kid [] of [] -> next; drawn -> drawn <> rest) rest (kids el)
       "use" -> case attr "href" el >>= BS.stripPrefix "#" . BC.strip of
-        Just key | Set.notMember key open, Just target <- Map.lookup key ids -> do
+        Just key | Set.size open < maxUseDepth, Set.notMember key open, Just target <- Map.lookup key ids -> do
           let draw = collect ids (Set.insert key open) (transform `multiply` translate (num el "x") (num el "y")) style
           if tag target `elem` ["symbol", "svg"] then foldr draw rest (kids target) else draw target rest
         _ -> rest
@@ -102,6 +104,12 @@ collect ids open outer inherited el rest
     own = foldl' property inherited {styleOpacity = 1} props
     style = own {styleOpacity = styleOpacity inherited * styleOpacity own}
     into = collect ids open transform style
+
+-- | How many @use@ elements may nest, counting through their targets; one
+-- nested deeper draws nothing. Firefox's @svg.use-element.recursive-clone-limit@
+-- is also 8.
+maxUseDepth :: Int
+maxUseDepth = 8
 
 -- | The segments of a basic shape or path, in its own coordinates.
 segments :: Element -> [Segment]
