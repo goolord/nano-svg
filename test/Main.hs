@@ -63,9 +63,13 @@ numbers =
         -- would reach whatever draws the result.
         parseNumber "1e400" @?= Nothing
         parseNumber "-1e400" @?= Nothing
-        parseNumber "0e400" @?= Nothing
         parseNumber (BC.replicate 400 '9') @?= Nothing
         parseNumber "1e-400" @?= Just 0
+    , testCase "but a large exponent on a small mantissa, or the reverse, is" do
+        parseNumber "0e400" @?= Just 0
+        parseNumber "-0.000e9999" @?= Just 0
+        parseNumber ("1" <> BC.replicate 400 '0' <> "e-400") @?= Just 1
+        parseNumber ("0." <> BC.replicate 400 '0' <> "15e401") @?= Just 1.5
         parsePath "M1 1L1e400 0" @?= [MoveTo (Point 1 1)]
         sizeOf "<svg width='1e400' height='1e400'/>" @?= (24, 24)
     , testCase "an odd point is dropped" $

@@ -79,8 +79,18 @@ number = do
   guard (not (BS.null int && BS.null frac))
   -- An @e@ without digits after it belongs to a unit, as in @1em@.
   e <- (F.skipSatisfyAscii (`elem` ['e', 'E']) *> power) <|> pure 0
-  let x = double2Float (BS.foldl' step (BS.foldl' step 0 int) frac * 10 ^^ (e - BS.length frac))
-  guard (not (isNaN x || isInfinite x))
+  -- Past 18 significant digits a Float cannot tell the difference, so the
+  -- rest only shift the exponent, and the mantissa fits a Double exactly.
+  let ds = BS.dropWhile (== 48) (int <> frac)
+      sig = BS.take 18 ds
+      k = e - BS.length frac + BS.length ds - BS.length sig
+      m = BS.foldl' step 0 sig
+      x
+        | m == 0 || k < -80 = 0
+        | k > 40 = 1 / 0
+        | k < 0 = double2Float (m / 10 ^ negate k)
+        | otherwise = double2Float (m * 10 ^ k)
+  guard (not (isInfinite x))
   pure (if neg then negate x else x)
   where
     minus = (True <$ sym '-') <|> (False <$ sym '+') <|> pure False
