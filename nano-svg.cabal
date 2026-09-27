@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               nano-svg
-version:            0.1.0.0
+version:            0.2.0.0
 synopsis:           An SVG parser for icons
 
 description:
@@ -21,11 +21,17 @@ license-file:       LICENSE
 author:             goolord
 maintainer:         zacharyachurchill@gmail.com
 category:           Graphics
+homepage:           https://github.com/goolord/nano-svg
+bug-reports:        https://github.com/goolord/nano-svg/issues
 build-type:         Simple
 tested-with:        GHC ==9.14.1
 extra-doc-files:
     CHANGELOG.md
     README.md
+
+source-repository head
+    type:     git
+    location: https://github.com/goolord/nano-svg.git
 
 common extensions
     default-language: GHC2021
