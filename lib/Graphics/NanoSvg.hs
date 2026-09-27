@@ -48,10 +48,12 @@ import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Primitive.SmallArray (SmallArray, smallArrayFromList)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Word (Word64)
+import FlatParse.Basic qualified as F
 import Graphics.NanoSvg.Attribute
 import Graphics.NanoSvg.Types
-import Numeric (readDec, readHex)
 import Text.XML.Hexml qualified as X
 
 -- | Parse UTF-8 SVG bytes. Fails on malformed XML or without an @svg@
@@ -67,7 +69,7 @@ parseSvg src = do
         _ -> Box 0 0 (fromMaybe 24 (side "width")) (fromMaybe 24 (side "height"))
       -- The first element with an id wins.
       ids = Map.fromListWith (\_ first -> first) [(i, el) | el <- descendants root, Just i <- [attr "id" el]]
-      shapes = collect ids [] identity defaultStyle root []
+      shapes = collect ids Set.empty identity defaultStyle root []
   pure
     Document
       { documentViewBox = box
@@ -79,15 +81,15 @@ parseSvg src = do
 
 -- | Prepend the shapes an element draws. @open@ holds the @use@ targets
 -- being expanded, to cut reference cycles.
-collect :: Map ByteString Element -> [ByteString] -> Matrix -> Style -> Element -> [Shape] -> [Shape]
+collect :: Map ByteString Element -> Set ByteString -> Matrix -> Style -> Element -> [Shape] -> [Shape]
 collect ids open outer inherited el rest
   | keyword "display" == Just "none" || keyword "visibility" `elem` [Just "hidden", Just "collapse"] = rest
   | otherwise = case tag el of
       t | t `elem` ["svg", "g", "a"] -> foldr into rest (kids el)
       "switch" -> foldr (\kid next -> case into kid [] of [] -> next; drawn -> drawn <> rest) rest (kids el)
       "use" -> case attr "href" el >>= BS.stripPrefix "#" . BC.strip of
-        Just key | key `notElem` open, Just target <- Map.lookup key ids -> do
-          let draw = collect ids (key : open) (transform `multiply` translate (num el "x") (num el "y")) style
+        Just key | Set.notMember key open, Just target <- Map.lookup key ids -> do
+          let draw = collect ids (Set.insert key open) (transform `multiply` translate (num el "x") (num el "y")) style
           if tag target `elem` ["symbol", "svg"] then foldr draw rest (kids target) else draw target rest
         _ -> rest
       _ | null (geometry el) -> rest
@@ -214,7 +216,7 @@ withoutDoctype s = before <> BC.drop 1 (BC.dropWhile (/= '>') decl)
     decl = if BC.elem '[' (BC.takeWhile (/= '>') doctype) then BC.dropWhile (/= ']') doctype else doctype
 
 -- | Decode the predefined entities and character references; leave anything
--- else as written.
+-- else as written. Linear in the length of the value.
 entities :: ByteString -> ByteString
 entities v
   | BC.notElem '&' v = v
@@ -222,20 +224,18 @@ entities v
   where
     go s = case BC.break (== '&') s of
       (a, b) | BS.null b -> B.byteString a
-      (a, b) -> B.byteString a <> case BC.break (== ';') (BS.drop 1 b) of
-        (ref, rest) | not (BS.null rest), Just c <- entity ref -> B.charUtf8 c <> go (BS.drop 1 rest)
+      (a, b) -> B.byteString a <> case BC.break (\c -> c == ';' || c == '&') (BS.drop 1 b) of
+        -- A reference cannot contain an ampersand, so the scan stops at the
+        -- next one instead of running on to a distant semicolon.
+        (ref, rest) | Just rest' <- BC.stripPrefix ";" rest, Just c <- entity ref -> B.charUtf8 c <> go rest'
         _ -> B.char7 '&' <> go (BS.drop 1 b)
-    entity ref = case BC.unpack ref of
-      "amp" -> Just '&'
-      "lt" -> Just '<'
-      "gt" -> Just '>'
-      "quot" -> Just '"'
-      "apos" -> Just '\''
-      '#' : x : h | toLower x == 'x' -> scalar (readHex h)
-      '#' : d -> scalar (readDec d)
-      _ -> Nothing
-    scalar :: [(Integer, String)] -> Maybe Char
-    scalar = \case
-      [(c, "")] | c > 0, c <= 0x10FFFF, c < 0xD800 || c > 0xDFFF -> Just (chr (fromInteger c))
+    entity ref = case BC.uncons ref of
+      Just ('#', n) -> case BC.uncons n of
+        Just (x, h) | toLower x == 'x' -> scalar F.anyAsciiHexInt h
+        _ -> scalar F.anyAsciiDecimalInt n
+      _ -> lookup ref [("amp", '&'), ("lt", '<'), ("gt", '>'), ("quot", '"'), ("apos", '\'')]
+    -- The digit parsers fail on overflow rather than wrap around.
+    scalar digits ds = case F.runParser (digits <* F.eof) ds of
+      F.OK c _ | c > 0, c <= 0x10FFFF, c < 0xD800 || c > 0xDFFF -> Just (chr c)
       _ -> Nothing
 

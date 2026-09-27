@@ -311,6 +311,10 @@ xml =
     , testCase "an ampersand that begins nothing stands for itself" $
         map (length . toList . shapeSegments) (shapesOf "<svg><path d='M0 0 &amp L1 1 &nosuch; &#;'/></svg>")
           @?= [1]
+    , testCase "and so does a reference past the last code point" $
+        -- Would wrap around to 'r' in 64-bit arithmetic.
+        styleFill (shapeStyle (oneShape "<svg><path fill='&#x10000000000000072;ed' d='M0 0L1 1'/></svg>"))
+          @?= Nothing
     , testCase "a document that is not one" $
         assertBool "expected a Left" (isLeft (parseSvg "<svg><b></svg>"))
     ]
