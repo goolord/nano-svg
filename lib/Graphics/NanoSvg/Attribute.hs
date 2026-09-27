@@ -28,6 +28,8 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as BC
 import Data.Char (digitToInt, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, isSpace, toLower)
 import Data.Fixed (mod')
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import FlatParse.Basic qualified as F
 import GHC.Float (double2Float)
 import Graphics.NanoSvg.Types
@@ -116,12 +118,35 @@ parseLength v = do
 
 -- | The @d@ attribute as absolute segments, keeping those before any error.
 parsePath :: ByteString -> [Segment]
-parsePath = prefix [] (path 'M' (Point 0 0) (MoveTo (Point 0 0)))
+parsePath = prefix [] (path 'M' (Point 0 0) (MoveTo (Point 0 0)) [])
 
--- | The rest of a path, given the command to repeat, the subpath start and
--- the previous segment.
-path :: Char -> Point -> Segment -> P [Segment]
-path cmd !start !prev = sep *> ((F.satisfyAscii letter <* sep) <|> pure cmd) >>= \c -> step c <|> pure []
+-- | The rest of a path, given the command to repeat, the subpath start, the
+-- previous segment and the segments so far in reverse.
+path :: Char -> Point -> Segment -> [Segment] -> P [Segment]
+path cmd !start !prev acc = do
+  c <- sep *> ((F.satisfyAscii letter <* sep) <|> pure cmd)
+  let rel = isAsciiLower c
+      -- Arguments after a moveto are linetos, and a closepath returns to the start.
+      next seg = case seg of
+        MoveTo p -> path (if rel then 'l' else 'L') p seg (seg : acc)
+        ClosePath -> path (if rel then 'm' else 'M') start seg (seg : acc)
+        _ -> path c start seg (seg : acc)
+  F.withOption (segment c start prev) next (pure (reverse acc))
+
+-- | One command's segment, given the subpath start and the previous segment.
+segment :: Char -> Point -> Segment -> P Segment
+segment c start prev = case toLower c of
+  'm' -> MoveTo <$> pt
+  'z' -> pure ClosePath
+  'l' -> LineTo <$> pt
+  'h' -> LineTo . (\x -> Point (if rel then cx + x else x) cy) <$> arg
+  'v' -> LineTo . (\y -> Point cx (if rel then cy + y else y)) <$> arg
+  'c' -> CubicTo <$> pt <*> pt <*> pt
+  's' -> CubicTo (case prev of CubicTo _ q _ -> reflect q; _ -> cur) <$> pt <*> pt
+  'q' -> QuadTo <$> pt <*> pt
+  't' -> QuadTo (case prev of QuadTo q _ -> reflect q; _ -> cur) <$> pt
+  'a' -> ArcTo <$> (abs <$> arg) <*> (abs <$> arg) <*> arg <*> flag <*> flag <*> pt
+  _ -> empty
   where
     cur@(Point cx cy) = case prev of
       MoveTo p -> p
@@ -131,25 +156,10 @@ path cmd !start !prev = sep *> ((F.satisfyAscii letter <* sep) <|> pure cmd) >>=
       ArcTo _ _ _ _ _ p -> p
       ClosePath -> start
     reflect (Point x y) = Point (2 * cx - x) (2 * cy - y)
-    step c = case toLower c of
-      -- Arguments after a moveto are linetos, and a closepath returns to the start.
-      'm' -> pt >>= \p -> (MoveTo p :) <$> path (if rel then 'l' else 'L') p (MoveTo p)
-      'z' -> (ClosePath :) <$> path (if rel then 'm' else 'M') start ClosePath
-      'l' -> emit . LineTo =<< pt
-      'h' -> emit . LineTo . (\x -> Point (if rel then cx + x else x) cy) =<< arg
-      'v' -> emit . LineTo . (\y -> Point cx (if rel then cy + y else y)) =<< arg
-      'c' -> emit =<< CubicTo <$> pt <*> pt <*> pt
-      's' -> emit =<< CubicTo (case prev of CubicTo _ q _ -> reflect q; _ -> cur) <$> pt <*> pt
-      'q' -> emit =<< QuadTo <$> pt <*> pt
-      't' -> emit . QuadTo (case prev of QuadTo q _ -> reflect q; _ -> cur) =<< pt
-      'a' -> emit =<< ArcTo <$> (abs <$> arg) <*> (abs <$> arg) <*> arg <*> flag <*> flag <*> pt
-      _ -> empty
-      where
-        rel = isAsciiLower c
-        pt = (\x y -> if rel then Point (cx + x) (cy + y) else Point x y) <$> arg <*> arg
-        emit !seg = (seg :) <$> path c start seg
-        -- Flags need no separator, as in @a1 1 0 00.5.5@.
-        flag = (== '1') <$> F.satisfyAscii (`elem` ['0', '1']) <* sep
+    rel = isAsciiLower c
+    pt = (\x y -> if rel then Point (cx + x) (cy + y) else Point x y) <$> arg <*> arg
+    -- Flags need no separator, as in @a1 1 0 00.5.5@.
+    flag = (== '1') <$> F.satisfyAscii (`elem` ['0', '1']) <* sep
 
 -- | A @transform@ list, the rightmost acting first. Unknown functions are the
 -- identity, and malformed syntax ends the list.
@@ -189,7 +199,7 @@ parseColor = whole color
 color :: P RGBA
 color = (sym '#' *> hex) <|> do
   name <- word
-  (sym '(' *> wsp *> function name <* wsp <* sym ')') <|> maybe empty pure (lookup name namedColors)
+  (sym '(' *> wsp *> function name <* wsp <* sym ')') <|> maybe empty pure (Map.lookup name namedColors)
 
 hex :: P RGBA
 hex = do
@@ -222,8 +232,8 @@ function name
     byte x = fromIntegral (max 0 (min 255 (round x :: Int)))
 
 -- | The CSS named colors, excluding the paint keywords.
-namedColors :: [(ByteString, RGBA)]
-namedColors = pairs (BC.words table)
+namedColors :: Map ByteString RGBA
+namedColors = Map.fromList (pairs (BC.words table))
   where
     pairs (n : c : r) = (n, prefix black hex c) : pairs r
     pairs _ = []

@@ -44,8 +44,10 @@ import Data.ByteString.Builder qualified as B
 import Data.ByteString.Char8 qualified as BC
 import Data.Char (chr, toLower)
 import Data.List (find)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
-import Data.Primitive.SmallArray (smallArrayFromList)
+import Data.Primitive.SmallArray (SmallArray, smallArrayFromList)
 import Data.Word (Word64)
 import Graphics.NanoSvg.Attribute
 import Graphics.NanoSvg.Types
@@ -63,8 +65,9 @@ parseSvg src = do
       box = case maybe [] parseNumberList (attr "viewBox" root) of
         [x, y, w, h] | w > 0, h > 0 -> Box x y w h
         _ -> Box 0 0 (fromMaybe 24 (side "width")) (fromMaybe 24 (side "height"))
-      ids = [(i, el) | el <- descendants root, Just i <- [attr "id" el]]
-      shapes = collect ids [] identity defaultStyle root
+      -- The first element with an id wins.
+      ids = Map.fromListWith (\_ first -> first) [(i, el) | el <- descendants root, Just i <- [attr "id" el]]
+      shapes = collect ids [] identity defaultStyle root []
   pure
     Document
       { documentViewBox = box
@@ -74,41 +77,54 @@ parseSvg src = do
       , documentMonochrome = null [() | Shape _ _ s <- shapes, Just (PaintColor _) <- [styleFill s, styleStroke s]]
       }
 
--- | The shapes an element draws. @open@ holds the @use@ targets being
--- expanded, to cut reference cycles.
-collect :: [(ByteString, Element)] -> [ByteString] -> Matrix -> Style -> Element -> [Shape]
-collect ids open outer inherited el
-  | keyword "display" == Just "none" || keyword "visibility" `elem` [Just "hidden", Just "collapse"] = []
+-- | Prepend the shapes an element draws. @open@ holds the @use@ targets
+-- being expanded, to cut reference cycles.
+collect :: Map ByteString Element -> [ByteString] -> Matrix -> Style -> Element -> [Shape] -> [Shape]
+collect ids open outer inherited el rest
+  | keyword "display" == Just "none" || keyword "visibility" `elem` [Just "hidden", Just "collapse"] = rest
   | otherwise = case tag el of
-      t | t `elem` ["svg", "g", "a"] -> concatMap into (kids el)
-      "switch" -> concat (take 1 (filter (not . null) (map into (kids el))))
+      t | t `elem` ["svg", "g", "a"] -> foldr into rest (kids el)
+      "switch" -> foldr (\kid next -> case into kid [] of [] -> next; drawn -> drawn <> rest) rest (kids el)
       "use" -> case attr "href" el >>= BS.stripPrefix "#" . BC.strip of
-        Just key | key `notElem` open, Just target <- lookup key ids -> do
-          let draw = collect ids (key : open) (transform `multiply` translate (num "x") (num "y")) style
-          if tag target `elem` ["symbol", "svg"] then concatMap draw (kids target) else draw target
-        _ -> []
-      "path" -> shape (parsePath (value "d"))
-      "rect" -> shape (rect (num "x") (num "y") (num "width") (num "height") (len "rx") (len "ry"))
-      "circle" -> shape (ellipse (num "cx") (num "cy") (num "r") (num "r"))
-      "ellipse" -> shape (ellipse (num "cx") (num "cy") (num "rx") (num "ry"))
-      "line" -> shape [MoveTo (Point (num "x1") (num "y1")), LineTo (Point (num "x2") (num "y2"))]
-      "polyline" -> shape (poly [])
-      "polygon" -> shape (poly [ClosePath])
-      _ -> []
+        Just key | key `notElem` open, Just target <- Map.lookup key ids -> do
+          let draw = collect ids (key : open) (transform `multiply` translate (num el "x") (num el "y")) style
+          if tag target `elem` ["symbol", "svg"] then foldr draw rest (kids target) else draw target rest
+        _ -> rest
+      _ | null (geometry el) -> rest
+        | otherwise -> Shape (geometry el) transform style : rest
   where
-    props = attrs el <> declarations (value "style")
-    keyword k = lower . BC.strip <$> lookup k (reverse props)
+    props = attrs el <> declarations (value "style" el)
+    latest = reverse props
+    keyword k = lower . BC.strip <$> lookup k latest
     transform = maybe outer (multiply outer . parseTransform) (attr "transform" el)
     own = foldl' property inherited {styleOpacity = 1} props
     style = own {styleOpacity = styleOpacity inherited * styleOpacity own}
     into = collect ids open transform style
-    shape segs = [Shape (smallArrayFromList segs) transform style | not (null segs)]
-    value k = fromMaybe "" (attr k el)
-    len k = attr k el >>= parseLength
-    num = fromMaybe 0 . len
-    poly close = case parsePoints (value "points") of
+
+-- | The segments of a basic shape or path, in its own coordinates.
+segments :: Element -> [Segment]
+segments el = case tag el of
+  "path" -> parsePath (value "d" el)
+  "rect" -> rect (num el "x") (num el "y") (num el "width") (num el "height") (len el "rx") (len el "ry")
+  "circle" -> ellipse (num el "cx") (num el "cy") (num el "r") (num el "r")
+  "ellipse" -> ellipse (num el "cx") (num el "cy") (num el "rx") (num el "ry")
+  "line" -> [MoveTo (Point (num el "x1") (num el "y1")), LineTo (Point (num el "x2") (num el "y2"))]
+  "polyline" -> poly []
+  "polygon" -> poly [ClosePath]
+  _ -> []
+  where
+    poly close = case parsePoints (value "points" el) of
       [] -> []
       p : ps -> MoveTo p : map LineTo ps <> close
+
+value :: ByteString -> Element -> ByteString
+value k = fromMaybe "" . attr k
+
+len :: Element -> ByteString -> Maybe Float
+len el k = attr k el >>= parseLength
+
+num :: Element -> ByteString -> Float
+num el = fromMaybe 0 . len el
 
 rect :: Float -> Float -> Float -> Float -> Maybe Float -> Maybe Float -> [Segment]
 rect x y w h mrx mry
@@ -169,19 +185,25 @@ lower = BC.map toLower
 -- XML
 --------------------------------------------------------------------------------
 
-data Element = Element {tag :: ByteString, attrs :: [(ByteString, ByteString)], kids :: [Element]}
+-- | 'geometry' is parsed on first draw and shared by every @use@ of the
+-- element.
+data Element = Element {tag :: ByteString, attrs :: [(ByteString, ByteString)], geometry :: SmallArray Segment, kids :: [Element]}
 
 attr :: ByteString -> Element -> Maybe ByteString
 attr k = lookup k . attrs
 
 descendants :: Element -> [Element]
-descendants el = el : concatMap descendants (kids el)
+descendants el = go el []
+  where
+    go e rest = e : foldr go rest (kids e)
 
 -- | Child elements, without the processing instructions hexml reports.
 nodes :: X.Node -> [Element]
 nodes n = [element c | c <- X.children n, not (BS.isPrefixOf "<?" (X.outer c))]
   where
-    element c = Element (local (X.name c)) [(local k, entities v) | X.Attribute k v <- X.attributes c] (nodes c)
+    element c = el
+      where
+        el = Element (local (X.name c)) [(local k, entities v) | X.Attribute k v <- X.attributes c] (smallArrayFromList (segments el)) (nodes c)
     local s = maybe s (\i -> BS.drop (i + 1) s) (BC.elemIndexEnd ':' s)
 
 -- | Remove a DOCTYPE, including an internal subset, which hexml rejects.

@@ -408,6 +408,10 @@ documents =
         length (shapesOf symbolDoc) @?= 2
     , testCase "the same target may be used more than once" $
         length (shapesOf twiceDoc) @?= 2
+    , testCase "a duplicated id refers to its first element" $
+        map (length . toList . shapeSegments)
+          (shapesOf "<svg><defs><line id='d' x2='1'/><rect id='d' width='1' height='1'/></defs><use href='#d'/></svg>")
+          @?= [2]
     , testCase "and a circular one draws each target once" do
         -- A cycle is cut where it closes, so a group that references
         -- itself several times cannot fan out: counting depth alone would

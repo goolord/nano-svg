@@ -61,6 +61,7 @@ library
     build-depends:
         base       >=4.17  && <4.23,
         bytestring >=0.11.1 && <0.13,
+        containers >=0.6    && <0.9,
         flatparse  >=0.5    && <0.6,
         hexml      >=0.3.5 && <0.4,
         primitive  >=0.9   && <0.10
