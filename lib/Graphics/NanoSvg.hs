@@ -11,6 +11,8 @@
 -- >   Left err -> putStrLn err
 -- >   Right doc -> print (documentSize doc, length (documentShapes doc))
 --
+-- 'encodeSvg' writes a document back out as SVG, one @path@ per shape.
+--
 -- = Supported SVG
 --
 -- The elements @svg@, @g@, @a@, @switch@, @use@, @path@, @rect@, @circle@,
@@ -33,26 +35,30 @@
 module Graphics.NanoSvg
   ( parseSvg
   , maxUseDepth
+  , encodeSvg
+  , svgBuilder
   , module Graphics.NanoSvg.Types
   , module Graphics.NanoSvg.Attribute
   )
 where
 
 import Control.Applicative ((<|>))
-import Data.Bits (xor)
+import Control.Monad (join)
+import Data.Bits (shiftR, xor)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Builder qualified as B
 import Data.ByteString.Char8 qualified as BC
 import Data.Char (chr, toLower)
-import Data.List (find)
+import Data.Foldable (toList)
+import Data.List (find, intersperse)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Primitive.SmallArray (SmallArray, smallArrayFromList)
 import Data.Set (Set)
 import Data.Set qualified as Set
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import FlatParse.Basic qualified as F
 import Graphics.NanoSvg.Attribute
 import Graphics.NanoSvg.Types
@@ -190,6 +196,87 @@ declarations s =
 lower :: ByteString -> ByteString
 lower = BC.map toLower
 
+
+--------------------------------------------------------------------------------
+-- Encoding
+--------------------------------------------------------------------------------
+
+-- | Write a document as UTF-8 SVG. 'parseSvg' reads the result back to the
+-- same view box, size and shapes.
+encodeSvg :: Document -> ByteString
+encodeSvg = BS.toStrict . B.toLazyByteString . svgBuilder
+
+-- | 'encodeSvg' as a 'B.Builder': one @path@ per shape, in paint order, with
+-- its transform and each property that differs from 'defaultStyle'.
+svgBuilder :: Document -> B.Builder
+svgBuilder doc =
+  "<svg xmlns=\"http://www.w3.org/2000/svg\""
+    <> attribute "width" (number w)
+    <> attribute "height" (number h)
+    <> attribute "viewBox" (spaced (map number [x, y, bw, bh]))
+    <> ">"
+    <> foldMap shape (documentShapes doc)
+    <> "</svg>"
+  where
+    Box x y bw bh = documentViewBox doc
+    (w, h) = documentSize doc
+
+shape :: Shape -> B.Builder
+shape (Shape segs m s) =
+  "<path"
+    <> attribute "d" (spaced (map segment (toList segs)))
+    <> (if m == identity then mempty else attribute "transform" (matrix m))
+    <> foldMap (attribute "fill" . paint) (styleFill s)
+    <> foldMap (attribute "fill-opacity" . number) (changed styleFillOpacity)
+    <> foldMap (attribute "fill-rule" . \case NonZero -> "nonzero"; EvenOdd -> "evenodd") (changed styleFillRule)
+    <> foldMap (attribute "stroke" . paint) (join (changed styleStroke))
+    <> foldMap (attribute "stroke-opacity" . number) (changed styleStrokeOpacity)
+    <> foldMap (attribute "stroke-width" . number) (changed styleStrokeWidth)
+    <> foldMap (attribute "stroke-linecap" . \case CapButt -> "butt"; CapRound -> "round"; CapSquare -> "square") (changed styleCap)
+    <> foldMap (attribute "stroke-linejoin" . \case JoinMiter -> "miter"; JoinRound -> "round"; JoinBevel -> "bevel") (changed styleJoin)
+    <> foldMap (attribute "stroke-miterlimit" . number) (changed styleMiterLimit)
+    <> foldMap (attribute "opacity" . number) (changed styleOpacity)
+    <> "/>"
+  where
+    changed :: Eq a => (Style -> a) -> Maybe a
+    changed field = if field s == field defaultStyle then Nothing else Just (field s)
+    matrix (Matrix a b c d e f) = "matrix(" <> spaced (map number [a, b, c, d, e, f]) <> ")"
+
+segment :: Segment -> B.Builder
+segment = \case
+  MoveTo p -> "M" <> point p
+  LineTo p -> "L" <> point p
+  CubicTo p q r -> "C" <> spaced [point p, point q, point r]
+  QuadTo p q -> "Q" <> spaced [point p, point q]
+  ArcTo rx ry angle large sweep p -> "A" <> spaced [number rx, number ry, number angle, flag large, flag sweep, point p]
+  ClosePath -> "Z"
+  where
+    point (Point px py) = number px <> " " <> number py
+    flag b = if b then "1" else "0"
+
+-- | @#rrggbb@, or @#rrggbbaa@ when not opaque.
+paint :: Paint -> B.Builder
+paint = \case
+  PaintNone -> "none"
+  PaintCurrent -> "currentColor"
+  PaintColor (RGBA c) -> "#" <> foldMap (B.word8HexFixed . channel) (if channel 0 == 255 then [24, 16, 8] else [24, 16, 8, 0])
+    where
+      channel k = fromIntegral (c `shiftR` k) :: Word8
+
+-- | The shortest digits that read back as the same 'Float', and an integer
+-- without a trailing @.0@.
+number :: Float -> B.Builder
+number v
+  | abs v < 1e7, v == fromIntegral i = B.intDec i
+  | otherwise = B.floatDec v
+  where
+    i = truncate v :: Int
+
+attribute :: B.Builder -> B.Builder -> B.Builder
+attribute k v = " " <> k <> "=\"" <> v <> "\""
+
+spaced :: [B.Builder] -> B.Builder
+spaced = mconcat . intersperse " "
 
 --------------------------------------------------------------------------------
 -- XML

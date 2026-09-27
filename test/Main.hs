@@ -3,12 +3,15 @@
 module Main (main) where
 
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as BS
+import Data.ByteString.Builder qualified as B
 import Data.ByteString.Char8 qualified as BC
-import Data.Foldable (toList)
+import Data.Foldable (for_, toList)
+import Data.Primitive.SmallArray (smallArrayFromList)
 import Graphics.NanoSvg
 import Test.Tasty
 import Test.Tasty.HUnit
-import Test.Tasty.QuickCheck
+import Test.Tasty.QuickCheck hiding (NonZero)
 
 main :: IO ()
 main =
@@ -22,6 +25,7 @@ main =
       , transforms
       , xml
       , documents
+      , encoding
       ]
 
 --------------------------------------------------------------------------------
@@ -247,10 +251,10 @@ paths =
     , testProperty "a relative path draws where the absolute one does" \ps ->
         let steps = take 12 (map (\(Small a, Small b) -> (a, b)) ps) :: [(Int, Int)]
             absolute = scanl1 (\(x, y) (dx, dy) -> (x + dx, y + dy)) steps
-            render c = BC.unwords [BC.pack (show a <> " " <> show b) | (a, b) <- c]
+            render c = foldMap (\(a, b) -> " " <> B.intDec a <> " " <> B.intDec b) c
          in not (null steps) ==>
-              parsePath ("M0 0 l" <> render steps)
-                == parsePath ("M0 0 L" <> render absolute)
+              parsePath (build ("M0 0 l" <> render steps))
+                == parsePath (build ("M0 0 L" <> render absolute))
     ]
 
 -- | A path's segments after the moveto that opened it.
@@ -467,6 +471,65 @@ documents =
     ]
 
 --------------------------------------------------------------------------------
+-- Encoding
+--------------------------------------------------------------------------------
+
+encoding :: TestTree
+encoding =
+  testGroup
+    "encoding"
+    [ testCase "a path per shape, with what differs from the defaults" $
+        either error encodeSvg (parseSvg holed)
+          @?= "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\" viewBox=\"0 0 10 10\">\
+              \<path d=\"M0 0 L10 0 L10 10 L0 10 Z M3 3 L7 3 L7 7 L3 7 Z\" fill=\"#ff0000\" fill-rule=\"evenodd\"/>\
+              \<path d=\"M0 0 L2 0 L2 2 L0 2 Z\" transform=\"matrix(0.5 0 0 0.5 5 0)\" fill=\"#0000ff\"/></svg>"
+    , testCase "a translucent color keeps its alpha, and a fraction its digits" $
+        either error encodeSvg (parseSvg "<svg viewBox='0 0 1 1'><path fill='#12345678' stroke-width='0.1' d='M1e-3 0L1e8 0'/></svg>")
+          @?= "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\" viewBox=\"0 0 1 1\">\
+              \<path d=\"M1.0e-3 0 L1.0e8 0\" fill=\"#12345678\" stroke-width=\"0.1\"/></svg>"
+    , testCase "the fixtures read back as they were" $
+        for_ [clock, holed, rectangles, polys, useDoc, twiceDoc, switchDoc] \src ->
+          let doc = either error id (parseSvg src)
+           in fmap (\d -> (documentViewBox d, documentSize d, toList (documentShapes d))) (parseSvg (encodeSvg doc))
+                @?= Right (documentViewBox doc, documentSize doc, toList (documentShapes doc))
+    , testProperty "any shapes read back as they were" $
+        forAll (listOf1 genShape) \shs ->
+          let doc = Document (Box 0 0 1 1) (1, 1) (smallArrayFromList shs) 0 False
+           in fmap (toList . documentShapes) (parseSvg (encodeSvg doc)) === Right shs
+    ]
+
+-- | A shape 'parseSvg' could have produced: some segments, and a style
+-- within the ranges it clamps to.
+genShape :: Gen Shape
+genShape = Shape <$> (smallArrayFromList <$> listOf1 segment) <*> matrix <*> style
+  where
+    point = Point <$> arbitrary <*> arbitrary
+    segment =
+      oneof
+        [ MoveTo <$> point
+        , LineTo <$> point
+        , CubicTo <$> point <*> point <*> point
+        , QuadTo <$> point <*> point
+        , ArcTo <$> (abs <$> arbitrary) <*> (abs <$> arbitrary) <*> arbitrary <*> arbitrary <*> arbitrary <*> point
+        , pure ClosePath
+        ]
+    matrix = oneof [pure identity, Matrix <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary]
+    paint = oneof [pure PaintNone, pure PaintCurrent, PaintColor <$> (rgba <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary)]
+    unit = choose (0, 1)
+    style =
+      Style
+        <$> liftArbitrary paint
+        <*> (Just <$> paint)
+        <*> (abs <$> arbitrary)
+        <*> elements [CapButt, CapRound, CapSquare]
+        <*> elements [JoinMiter, JoinRound, JoinBevel]
+        <*> ((1 +) . abs <$> arbitrary)
+        <*> elements [NonZero, EvenOdd]
+        <*> unit
+        <*> unit
+        <*> unit
+
+--------------------------------------------------------------------------------
 -- Fixtures
 --------------------------------------------------------------------------------
 
@@ -516,18 +579,26 @@ circularFanout n =
 -- | @n@ nested uses, the innermost of a rectangle.
 useChain :: Int -> ByteString
 useChain n =
-  "<svg><defs>"
-    <> mconcat [BC.pack ("<use id='u" <> show i <> "' href='#u" <> show (i + 1) <> "'/>") | i <- [1 .. n - 1]]
-    <> BC.pack ("<rect id='u" <> show n <> "' width='1' height='1'/>")
-    <> "</defs><use href='#u1'/></svg>"
+  build $
+    "<svg><defs>"
+      <> foldMap (\i -> "<use id='u" <> B.intDec i <> "' href='#u" <> B.intDec (i + 1) <> "'/>") [1 .. n - 1]
+      <> "<rect id='u" <> B.intDec n <> "' width='1' height='1'/></defs><use href='#u1'/></svg>"
 
 -- | A use of @n@ levels of groups, each drawing the one below it twice,
 -- over a rectangle: @2^n@ rectangles at @n + 1@ nested uses.
 fanout :: Int -> ByteString
 fanout n =
-  "<svg><defs><rect id='g0' width='1' height='1'/>"
-    <> mconcat [BC.pack ("<g id='g" <> show i <> "'><use href='#g" <> show (i - 1) <> "'/><use href='#g" <> show (i - 1) <> "'/></g>") | i <- [1 .. n]]
-    <> BC.pack ("</defs><use href='#g" <> show n <> "'/></svg>")
+  build $
+    "<svg><defs><rect id='g0' width='1' height='1'/>"
+      <> foldMap group [1 .. n]
+      <> "</defs><use href='#g" <> B.intDec n <> "'/></svg>"
+  where
+    group i = "<g id='g" <> B.intDec i <> "'>" <> use <> use <> "</g>"
+      where
+        use = "<use href='#g" <> B.intDec (i - 1) <> "'/>"
+
+build :: B.Builder -> ByteString
+build = BS.toStrict . B.toLazyByteString
 
 circular :: ByteString
 circular =

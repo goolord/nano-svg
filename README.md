@@ -30,6 +30,10 @@ shorthands and basic shapes become a common set of absolute path segments.
 The renderer walks segments without resolving an SVG tree, style inheritance
 or a transform stack. It still tracks the current point and subpath start.
 
+`encodeSvg :: Document -> ByteString` writes a document back out as SVG, one
+`path` per shape; `svgBuilder` gives the same as a bytestring `Builder`.
+Parsing the result gives back the same shapes.
+
 ## SVG scope
 
 Supports paths, rectangles, circles, ellipses, lines, polylines and polygons;
@@ -49,7 +53,7 @@ Nested `svg` and referenced `symbol` elements do not establish viewports.
 
 | Module | Purpose |
 | --- | --- |
-| `Graphics.NanoSvg` | `parseSvg`, re-exporting the two below |
+| `Graphics.NanoSvg` | `parseSvg` and `encodeSvg`, re-exporting the two below |
 | `Graphics.NanoSvg.Types` | the document model and matrix helpers |
 | `Graphics.NanoSvg.Attribute` | standalone parsers for paths, transforms, colors, numbers and lengths |
 
